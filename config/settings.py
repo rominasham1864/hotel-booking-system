@@ -25,6 +25,7 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+    "rest_framework",
     "rooms.apps.RoomsConfig",
     "bookings.apps.BookingsConfig",
 ]
@@ -102,4 +103,8 @@ LOGGING = {
     "loggers": {
         "django": {"handlers": ["console"], "level": LOG_LEVEL, "propagate": False},
     },
+}
+
+REST_FRAMEWORK = {
+    "EXCEPTION_HANDLER": "config.api_exceptions.api_exception_handler",
 }
