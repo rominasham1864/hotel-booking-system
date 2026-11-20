@@ -30,4 +30,6 @@ media/
 .DS_Store
 Thumbs.db
 
+# Personal planning and design notes (keep local for now)
 README.md
+docs/
