@@ -1,8 +1,16 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from datetime import timezone as datetime_timezone
+from threading import Barrier
 from unittest.mock import patch
 
-from django.db import IntegrityError, transaction
+from django.db import (
+    IntegrityError,
+    close_old_connections,
+    connection,
+    connections,
+    transaction,
+)
 from django.db.models.deletion import ProtectedError
 from django.test import (
     SimpleTestCase,
@@ -16,7 +24,7 @@ from rest_framework.test import APITestCase
 
 from bookings.exceptions import InvalidBookingRequest, NoAvailableRoom
 from bookings.models import Booking
-from bookings.services import create_booking, periods_overlap
+from bookings.services import OVERLAP_CONSTRAINT_NAME, create_booking, periods_overlap
 from rooms.models import Room
 
 @skipUnlessDBFeature("supports_table_check_constraints")
@@ -362,3 +370,114 @@ class BookingCreateAPITests(APITestCase):
     def test_get_not_supported(self):
         response = self.client.get(BOOKINGS_URL)
         self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+
+
+class BookingConcurrencyTests(TransactionTestCase):
+    """TransactionTestCase permits real commits across separate connections."""
+
+    def setUp(self):
+        if connection.vendor != "postgresql":
+            self.skipTest("Booking concurrency tests require PostgreSQL.")
+        self.check_in = datetime(2027, 2, 10, 14, 0, tzinfo=datetime_timezone.utc)
+        self.check_out = datetime(2027, 2, 12, 11, 0, tzinfo=datetime_timezone.utc)
+        self.first_room = Room.objects.create(label="101", beds=2, view="sea")
+
+    def _book(self, *, user_id: str):
+        return create_booking(
+            user_id=user_id,
+            beds=2,
+            view="sea",
+            check_in=self.check_in,
+            check_out=self.check_out,
+        )
+
+    def _run_two_requests(self):
+        """Synchronize starts, with one DB connection per worker thread."""
+        gate = Barrier(3)
+
+        def worker(user_id):
+            close_old_connections()
+            try:
+                gate.wait(timeout=15)
+                try:
+                    booking = self._book(user_id=user_id)
+                except NoAvailableRoom:
+                    return ("unavailable", None)
+                return ("created", booking.room_id)
+            finally:
+                connections.close_all()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(worker, "user-A")
+            second = executor.submit(worker, "user-B")
+            gate.wait(timeout=15)
+            return [first.result(timeout=30), second.result(timeout=30)]
+
+    def test_two_simultaneous_requests_cannot_double_book_single_room(self):
+        results = self._run_two_requests()
+        self.assertEqual(sorted(kind for kind, _ in results), ["created", "unavailable"])
+        self.assertEqual(Booking.objects.count(), 1)
+
+    def test_simultaneous_requests_use_distinct_rooms_if_available(self):
+        second_room = Room.objects.create(label="102", beds=2, view="sea")
+        results = self._run_two_requests()
+        self.assertEqual([kind for kind, _ in results].count("created"), 2)
+        self.assertEqual(
+            {room_id for kind, room_id in results},
+            {self.first_room.pk, second_room.pk},
+        )
+        self.assertEqual(Booking.objects.count(), 2)
+
+    def test_direct_model_create_cannot_bypass_overlap_constraint(self):
+        self._book(user_id="user-A")
+        with self.assertRaises(IntegrityError) as raised:
+            with transaction.atomic():
+                Booking.objects.create(
+                    room=self.first_room,
+                    user_id="user-B",
+                    check_in=self.check_in + timedelta(hours=2),
+                    check_out=self.check_out,
+                )
+        diagnostic = getattr(raised.exception.__cause__, "diag", None)
+        self.assertEqual(getattr(diagnostic, "constraint_name", None), OVERLAP_CONSTRAINT_NAME)
+        self.assertEqual(Booking.objects.count(), 1)
+
+    def test_adjacent_reservations_are_allowed_by_constraint(self):
+        self._book(user_id="user-A")
+        Booking.objects.create(
+            room=self.first_room,
+            user_id="user-B",
+            check_in=self.check_out,
+            check_out=self.check_out + timedelta(days=1),
+        )
+        self.assertEqual(Booking.objects.count(), 2)
+
+    def test_direct_update_cannot_create_overlap(self):
+        self._book(user_id="user-A")
+        later_booking = Booking.objects.create(
+            room=self.first_room,
+            user_id="user-B",
+            check_in=self.check_out,
+            check_out=self.check_out + timedelta(days=2),
+        )
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                Booking.objects.filter(pk=later_booking.pk).update(
+                    check_in=self.check_in + timedelta(hours=1),
+                )
+        later_booking.refresh_from_db()
+        self.assertEqual(later_booking.check_in, self.check_out)
+
+    def test_outer_transaction_rolls_back_service_write(self):
+        with self.assertRaisesRegex(RuntimeError, "simulate failure"):
+            with transaction.atomic():
+                self._book(user_id="user-A")
+                raise RuntimeError("simulate failure")
+        self.assertEqual(Booking.objects.count(), 0)
+
+    def test_constraint_is_installed_in_postgres(self):
+        with connection.cursor() as cursor:
+            db_constraints = connection.introspection.get_constraints(
+                cursor, Booking._meta.db_table
+            )
+        self.assertIn(OVERLAP_CONSTRAINT_NAME, db_constraints)
