@@ -1,3 +1,4 @@
+from django.http import QueryDict
 from rest_framework import serializers
 
 from config.api_exceptions import APIConflict
@@ -9,6 +10,8 @@ class StrictModelSerializer(serializers.ModelSerializer):
         if hasattr(data, "keys"):
             allowed_fields = {field.field_name for field in self._writable_fields}
             unknown_fields = set(data.keys()) - allowed_fields
+            if isinstance(data, QueryDict):
+                unknown_fields.discard("csrfmiddlewaretoken")
             if unknown_fields:
                 raise serializers.ValidationError(
                     {field: ["Unknown field."] for field in sorted(unknown_fields)}
@@ -16,10 +19,17 @@ class StrictModelSerializer(serializers.ModelSerializer):
         return super().to_internal_value(data)
 
 
+class RoomViewChoiceField(serializers.ChoiceField):
+    def to_internal_value(self, data):
+        if isinstance(data, str):
+            data = data.lower()
+        return super().to_internal_value(data)
+
+
 class RoomSerializer(StrictModelSerializer):
     label = serializers.CharField(max_length=100, trim_whitespace=True)
     beds = serializers.IntegerField(min_value=1, max_value=5)
-    view = serializers.ChoiceField(choices=Room.View.choices)
+    view = RoomViewChoiceField(choices=Room.View.choices)
 
     class Meta:
         model = Room

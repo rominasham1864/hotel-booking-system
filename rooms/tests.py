@@ -2,6 +2,7 @@ from django.db import IntegrityError, transaction
 from django.test import TransactionTestCase, skipUnlessDBFeature
 from django.utils import timezone
 from datetime import timedelta
+from urllib.parse import urlencode
 from rest_framework import status
 from rest_framework.test import APITestCase
 
@@ -66,6 +67,31 @@ class RoomAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data["label"], "101")
         self.assertEqual(Room.objects.count(), 1)
+
+    def test_create_room_from_html_form_with_csrf_token(self):
+        form = self.client.get(self.list_url, HTTP_ACCEPT="text/html")
+        self.assertContains(form, 'name="csrfmiddlewaretoken"')
+        self.assertContains(form, 'value="yard"')
+        csrf_token = form.cookies["csrftoken"].value
+
+        for index, view in enumerate(("yard", "Yard")):
+            with self.subTest(view=view):
+                response = self.client.post(
+                    self.list_url,
+                    urlencode({
+                        "label": f"Room {index}",
+                        "beds": 2,
+                        "view": view,
+                        "csrfmiddlewaretoken": csrf_token,
+                    }),
+                    content_type="application/x-www-form-urlencoded",
+                )
+
+                self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+                self.assertEqual(response.data["view"], Room.View.YARD)
+                self.assertEqual(
+                    Room.objects.get(pk=response.data["id"]).view, Room.View.YARD
+                )
 
     def test_create_rejects_invalid_beds_view_and_unknown_fields(self):
         invalid_payloads = [
