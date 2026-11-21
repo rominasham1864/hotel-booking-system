@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 from datetime import timezone as datetime_timezone
+from unittest.mock import patch
 
 from django.db import IntegrityError, transaction
 from django.db.models.deletion import ProtectedError
@@ -9,6 +10,9 @@ from django.test import (
     TransactionTestCase,
     skipUnlessDBFeature,
 )
+
+from rest_framework import status
+from rest_framework.test import APITestCase
 
 from bookings.exceptions import InvalidBookingRequest, NoAvailableRoom
 from bookings.models import Booking
@@ -206,3 +210,155 @@ class BookingServiceTests(TestCase):
         self.assertEqual(booking.check_in, START)
         self.assertEqual(booking.check_out, END)
         self.assertEqual(booking.check_in.utcoffset(), timedelta(0))
+
+
+BOOKINGS_URL = "/api/v1/bookings/"
+CHECK_IN = datetime(2027, 1, 10, 14, 0, tzinfo=datetime_timezone.utc)
+CHECK_OUT = datetime(2027, 1, 12, 11, 0, tzinfo=datetime_timezone.utc)
+
+
+class BookingCreateAPITests(APITestCase):
+    def setUp(self):
+        self.first_room = Room.objects.create(label="101", beds=2, view="sea")
+        self.second_room = Room.objects.create(label="102", beds=2, view="sea")
+        self.valid_payload = {
+            "user_id": "user-42",
+            "beds": 2,
+            "view": "sea",
+            "check_in": CHECK_IN.isoformat(),
+            "check_out": CHECK_OUT.isoformat(),
+        }
+
+    def post_booking(self, payload=None, *, key="phase6-request-1"):
+        return self.client.post(
+            BOOKINGS_URL,
+            data=self.valid_payload if payload is None else payload,
+            format="json",
+            HTTP_IDEMPOTENCY_KEY=key,
+        )
+
+    def test_valid_request_creates_booking_and_returns_room(self):
+        payload = {**self.valid_payload, "user_id": " user-42 "}
+        response = self.post_booking(payload)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(Booking.objects.count(), 1)
+        self.assertEqual(response.data["user_id"], "user-42")
+        self.assertEqual(response.data["room"]["id"], self.first_room.id)
+        self.assertEqual(response.data["room"]["label"], "101")
+        self.assertIn("created_at", response.data)
+        self.assertTrue(response.data["check_in"].endswith("Z"))
+        self.assertTrue(response.data["check_out"].endswith("Z"))
+
+    def test_selects_next_free_room(self):
+        Booking.objects.create(
+            room=self.first_room,
+            user_id="existing-user",
+            check_in=CHECK_IN,
+            check_out=CHECK_OUT,
+        )
+        response = self.post_booking()
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["room"]["id"], self.second_room.id)
+
+    def test_no_available_room_returns_409_and_does_not_write(self):
+        for room in (self.first_room, self.second_room):
+            Booking.objects.create(
+                room=room,
+                user_id="existing-user",
+                check_in=CHECK_IN,
+                check_out=CHECK_OUT,
+            )
+        response = self.post_booking()
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(response.data["error"]["code"], "no_available_room")
+        self.assertEqual(Booking.objects.count(), 2)
+
+    def test_unmatched_features_return_409_and_do_not_write(self):
+        response = self.post_booking({**self.valid_payload, "beds": 5})
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(Booking.objects.count(), 0)
+
+    def test_missing_required_field_returns_400(self):
+        payload = dict(self.valid_payload)
+        payload.pop("check_in")
+        response = self.post_booking(payload)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("check_in", response.data["error"]["fields"])
+        self.assertEqual(Booking.objects.count(), 0)
+
+    def test_invalid_room_features_return_400(self):
+        for field, value in (("beds", 0), ("beds", True), ("view", "ocean")):
+            with self.subTest(field=field, value=value):
+                response = self.post_booking({**self.valid_payload, field: value})
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assertIn(field, response.data["error"]["fields"])
+        self.assertEqual(Booking.objects.count(), 0)
+
+    def test_unknown_request_field_is_rejected(self):
+        response = self.post_booking({**self.valid_payload, "room_id": 123})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("room_id", response.data["error"]["fields"])
+        self.assertEqual(Booking.objects.count(), 0)
+
+    def test_equal_or_reversed_date_range_returns_400(self):
+        for check_out in (CHECK_IN, CHECK_IN - timedelta(hours=1)):
+            with self.subTest(check_out=check_out):
+                response = self.post_booking(
+                    {**self.valid_payload, "check_out": check_out.isoformat()}
+                )
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assertIn("check_out", response.data["error"]["fields"])
+        self.assertEqual(Booking.objects.count(), 0)
+
+    def test_naive_timestamp_is_rejected(self):
+        response = self.post_booking(
+            {**self.valid_payload, "check_in": "2027-01-10T14:00:00"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("check_in", response.data["error"]["fields"])
+        self.assertEqual(Booking.objects.count(), 0)
+
+    def test_offset_timestamp_is_returned_as_utc(self):
+        iran_timezone = datetime_timezone(timedelta(hours=3, minutes=30))
+        payload = {
+            **self.valid_payload,
+            "check_in": CHECK_IN.astimezone(iran_timezone).isoformat(),
+            "check_out": CHECK_OUT.astimezone(iran_timezone).isoformat(),
+        }
+        response = self.post_booking(payload)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["check_in"], "2027-01-10T14:00:00Z")
+        self.assertEqual(response.data["check_out"], "2027-01-12T11:00:00Z")
+
+    def test_missing_idempotency_key_returns_400(self):
+        response = self.client.post(BOOKINGS_URL, self.valid_payload, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Idempotency-Key", response.data["error"]["fields"])
+        self.assertEqual(Booking.objects.count(), 0)
+
+    def test_invalid_idempotency_key_returns_400(self):
+        for key in ("   ", "x" * 256):
+            with self.subTest(key_length=len(key)):
+                response = self.post_booking(key=key)
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(Booking.objects.count(), 0)
+
+    def test_empty_user_id_is_rejected(self):
+        response = self.post_booking({**self.valid_payload, "user_id": "  "})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(Booking.objects.count(), 0)
+
+    def test_domain_validation_error_maps_to_400(self):
+        with patch(
+            "bookings.views.create_booking",
+            side_effect=InvalidBookingRequest("Invalid booking period."),
+        ):
+            response = self.post_booking()
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data["error"]["code"], "validation_error")
+        self.assertEqual(Booking.objects.count(), 0)
+
+    def test_get_not_supported(self):
+        response = self.client.get(BOOKINGS_URL)
+        self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
