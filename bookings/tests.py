@@ -1,7 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from datetime import timezone as datetime_timezone
-from threading import Barrier
+from threading import Barrier, Event, Thread, current_thread
 from unittest.mock import patch
 
 from django.db import (
@@ -20,10 +20,11 @@ from django.test import (
 )
 
 from rest_framework import status
-from rest_framework.test import APITestCase
+from rest_framework.test import APIClient, APITestCase
 
 from bookings.exceptions import InvalidBookingRequest, NoAvailableRoom
-from bookings.models import Booking
+from bookings.idempotency import semantic_payload_hash
+from bookings.models import Booking, IdempotencyRecord
 from bookings.services import OVERLAP_CONSTRAINT_NAME, create_booking, periods_overlap
 from rooms.models import Room
 
@@ -481,3 +482,225 @@ class BookingConcurrencyTests(TransactionTestCase):
                 cursor, Booking._meta.db_table
             )
         self.assertIn(OVERLAP_CONSTRAINT_NAME, db_constraints)
+
+
+IDEMPOTENCY_CHECK_IN = datetime(2027, 3, 10, 14, 0, tzinfo=datetime_timezone.utc)
+IDEMPOTENCY_CHECK_OUT = datetime(2027, 3, 12, 11, 0, tzinfo=datetime_timezone.utc)
+
+
+def booking_payload(*, user_id="user-42"):
+    return {
+        "user_id": user_id,
+        "beds": 2,
+        "view": "sea",
+        "check_in": IDEMPOTENCY_CHECK_IN.isoformat(),
+        "check_out": IDEMPOTENCY_CHECK_OUT.isoformat(),
+    }
+
+
+class BookingIdempotencyAPITests(APITestCase):
+    def setUp(self):
+        if connection.vendor != "postgresql":
+            self.skipTest("Phase 8 uses PostgreSQL advisory locks.")
+        Room.objects.create(label="101", beds=2, view="sea")
+        Room.objects.create(label="102", beds=2, view="sea")
+
+    def post(self, payload=None, *, key="request-001"):
+        return self.client.post(
+            BOOKINGS_URL,
+            data=booking_payload() if payload is None else payload,
+            format="json",
+            HTTP_IDEMPOTENCY_KEY=key,
+        )
+
+    def test_first_request_creates_booking_and_completed_record(self):
+        response = self.post()
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(Booking.objects.count(), 1)
+        record = IdempotencyRecord.objects.get()
+        self.assertEqual(record.user_id, "user-42")
+        self.assertEqual(record.key, "request-001")
+        self.assertEqual(record.status, IdempotencyRecord.Status.COMPLETED)
+        self.assertEqual(record.booking_id, response.data["id"])
+        self.assertEqual(record.response_status, 201)
+        self.assertEqual(record.response_body, response.data)
+        self.assertIsNotNone(record.request_id)
+
+    def test_same_key_and_same_payload_replays_original_response(self):
+        first = self.post()
+        second = self.post()
+        self.assertEqual((first.status_code, second.status_code), (201, 201))
+        self.assertEqual(first.data, second.data)
+        self.assertEqual(Booking.objects.count(), 1)
+        self.assertEqual(IdempotencyRecord.objects.count(), 1)
+
+    def test_replay_retains_response_snapshot_after_room_changes(self):
+        first = self.post()
+        Room.objects.filter(pk=first.data["room"]["id"]).update(label="renamed")
+        replay = self.post()
+        self.assertEqual(replay.data, first.data)
+        self.assertEqual(replay.data["room"]["label"], "101")
+
+    def test_identical_instant_with_different_utc_offset_is_same_payload(self):
+        first = self.post()
+        offset = datetime_timezone(timedelta(hours=3, minutes=30))
+        second_payload = booking_payload()
+        second_payload["check_in"] = IDEMPOTENCY_CHECK_IN.astimezone(offset).isoformat()
+        second_payload["check_out"] = IDEMPOTENCY_CHECK_OUT.astimezone(offset).isoformat()
+        second = self.post(second_payload)
+        self.assertEqual(second.status_code, 201)
+        self.assertEqual(second.data, first.data)
+        self.assertEqual(Booking.objects.count(), 1)
+
+    def test_trimmed_user_id_is_same_semantic_payload(self):
+        first = self.post()
+        second = self.post({**booking_payload(), "user_id": "  user-42  "})
+        self.assertEqual(second.status_code, 201)
+        self.assertEqual(second.data, first.data)
+        self.assertEqual(Booking.objects.count(), 1)
+
+    def test_reusing_same_key_with_different_payload_is_409(self):
+        self.post()
+        response = self.post({**booking_payload(), "beds": 3})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data["error"]["code"], "idempotency_key_reused")
+        self.assertEqual(Booking.objects.count(), 1)
+        self.assertEqual(IdempotencyRecord.objects.count(), 1)
+
+    def test_same_key_is_scoped_to_user_id(self):
+        first = self.post()
+        second = self.post(booking_payload(user_id="user-99"))
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 201)
+        self.assertEqual(Booking.objects.count(), 2)
+        self.assertEqual(IdempotencyRecord.objects.count(), 2)
+        self.assertNotEqual(first.data["room"]["id"], second.data["room"]["id"])
+
+    def test_no_availability_does_not_persist_idempotency_record(self):
+        # The request cannot reserve a matching 5-bed room yet.
+        payload = {**booking_payload(), "beds": 5}
+        unavailable = self.post(payload)
+        self.assertEqual(unavailable.status_code, 409)
+        self.assertEqual(unavailable.data["error"]["code"], "no_available_room")
+        self.assertEqual(IdempotencyRecord.objects.count(), 0)
+        Room.objects.create(label="105", beds=5, view="sea")
+        retry = self.post(payload)
+        self.assertEqual(retry.status_code, 201)
+        self.assertEqual(IdempotencyRecord.objects.count(), 1)
+        self.assertEqual(Booking.objects.count(), 1)
+
+    def test_invalid_payload_does_not_persist_record(self):
+        response = self.post({**booking_payload(), "beds": 0})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(IdempotencyRecord.objects.count(), 0)
+        self.assertEqual(Booking.objects.count(), 0)
+
+    def test_failed_response_serialization_rolls_back_both_writes(self):
+        with patch(
+            "bookings.views.BookingResponseSerializer",
+            side_effect=RuntimeError("response serialization failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "serialization failed"):
+                self.post()
+        self.assertEqual(IdempotencyRecord.objects.count(), 0)
+        self.assertEqual(Booking.objects.count(), 0)
+
+    def test_database_unique_key_prevents_duplicate_record_bypass(self):
+        self.post()
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                IdempotencyRecord.objects.create(
+                    user_id="user-42",
+                    key="request-001",
+                    request_hash="0" * 64,
+                )
+        self.assertEqual(IdempotencyRecord.objects.count(), 1)
+
+    def test_existing_processing_record_returns_in_progress(self):
+        semantic_data = {
+            "user_id": "user-42",
+            "beds": 2,
+            "view": "sea",
+            "check_in": IDEMPOTENCY_CHECK_IN,
+            "check_out": IDEMPOTENCY_CHECK_OUT,
+        }
+        IdempotencyRecord.objects.create(
+            user_id="user-42",
+            key="request-001",
+            request_hash=semantic_payload_hash(semantic_data),
+            status=IdempotencyRecord.Status.PROCESSING,
+        )
+        response = self.post()
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data["error"]["code"], "idempotency_request_in_progress")
+        self.assertEqual(Booking.objects.count(), 0)
+
+
+class BookingIdempotencyConcurrencyTests(TransactionTestCase):
+    """Two requests use distinct real database connections."""
+
+    def setUp(self):
+        if connection.vendor != "postgresql":
+            self.skipTest("Phase 8 concurrency tests require PostgreSQL.")
+        Room.objects.create(label="101", beds=2, view="sea")
+        Room.objects.create(label="102", beds=2, view="sea")
+
+    def test_concurrent_same_key_returns_in_progress_then_replays(self):
+        started, release = Event(), Event()
+        outcome = {}
+
+        def slow_create_booking(**kwargs):
+            if current_thread().name == "idempotency-holder":
+                started.set()  # Advisory lock is held by this point.
+                if not release.wait(timeout=15):
+                    raise RuntimeError("Test timed out waiting to release booking")
+            return create_booking(**kwargs)
+
+        def first_request():
+            close_old_connections()
+            try:
+                client = APIClient()
+                response = client.post(
+                    BOOKINGS_URL,
+                    data=booking_payload(),
+                    format="json",
+                    HTTP_IDEMPOTENCY_KEY="same-key",
+                )
+                outcome["status"] = response.status_code
+                outcome["body"] = response.data
+            except Exception as error:  # surface errors from the worker thread
+                outcome["error"] = error
+            finally:
+                connections.close_all()
+
+        with patch("bookings.views.create_booking", side_effect=slow_create_booking):
+            thread = Thread(target=first_request, name="idempotency-holder", daemon=True)
+            thread.start()
+            try:
+                self.assertTrue(started.wait(timeout=10), "First request did not enter booking")
+                duplicate = APIClient().post(
+                    BOOKINGS_URL,
+                    data=booking_payload(),
+                    format="json",
+                    HTTP_IDEMPOTENCY_KEY="same-key",
+                )
+                self.assertEqual(duplicate.status_code, 409)
+                self.assertEqual(
+                    duplicate.data["error"]["code"],
+                    "idempotency_request_in_progress",
+                )
+            finally:
+                release.set()
+                thread.join(timeout=20)
+
+        self.assertFalse(thread.is_alive(), "First request did not finish")
+        if "error" in outcome:
+            raise outcome["error"]
+        self.assertEqual(outcome["status"], 201)
+        replay = APIClient().post(
+            BOOKINGS_URL, data=booking_payload(), format="json", HTTP_IDEMPOTENCY_KEY="same-key"
+        )
+        self.assertEqual(replay.status_code, 201)
+        self.assertEqual(replay.data, outcome["body"])
+        self.assertEqual(Booking.objects.count(), 1)
+        self.assertEqual(IdempotencyRecord.objects.count(), 1)

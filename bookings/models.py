@@ -5,6 +5,7 @@ from django.db.models.functions import Trim
 from django.utils import timezone
 
 from rooms.models import Room
+import uuid
 
 
 class Booking(models.Model):
@@ -61,3 +62,53 @@ class Booking(models.Model):
 
     def __str__(self):
         return f"Booking {self.pk} — {self.room}"
+
+
+
+class IdempotencyRecord(models.Model):
+    """Durable snapshot of a successful booking request and its response."""
+
+    class Status(models.TextChoices):
+        PROCESSING = "processing", "Processing"
+        COMPLETED = "completed", "Completed"
+
+    user_id = models.CharField(max_length=128)
+    key = models.CharField(max_length=255)
+    request_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    request_hash = models.CharField(max_length=64)
+    status = models.CharField(
+        max_length=16, choices=Status.choices, default=Status.PROCESSING
+    )
+    # Intentionally not a ForeignKey: the saved response stays replayable even
+    # when the original Booking is explicitly deleted under the room deletion policy.
+    booking_id = models.BigIntegerField(null=True, blank=True)
+    response_status = models.PositiveSmallIntegerField(null=True, blank=True)
+    response_body = models.JSONField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user_id", "key"],
+                name="bookings_idempotency_user_key_uniq",
+            ),
+            # Never allow a completed record without a saved successful result.
+            models.CheckConstraint(
+                check=(
+                    models.Q(
+                        status="processing",
+                        booking_id__isnull=True,
+                        response_status__isnull=True,
+                        response_body__isnull=True,
+                    )
+                    | models.Q(
+                        status="completed",
+                        booking_id__isnull=False,
+                        response_status=201,
+                        response_body__isnull=False,
+                    )
+                ),
+                name="bookings_idempotency_valid_state",
+            ),
+        ]

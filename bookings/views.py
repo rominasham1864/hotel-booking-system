@@ -1,16 +1,21 @@
-"""HTTP adapter for creating hotel room bookings (API v1)."""
+"""Booking HTTP adapter for phases 6-8 (merged version)."""
 
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from bookings.exceptions import InvalidBookingRequest, NoAvailableRoom
+from bookings.exceptions import (
+    IdempotencyKeyReused,
+    IdempotencyRequestInProgress,
+    InvalidBookingRequest,
+    NoAvailableRoom,
+)
+from bookings.idempotency import create_idempotent_booking
 from bookings.serializers import BookingRequestSerializer, BookingResponseSerializer
 from bookings.services import create_booking
 
 
 def _error_response(*, code, message, status_code, fields=None):
-    """Apply the documented API error envelope for expected booking errors."""
     error = {"code": code, "message": message}
     if fields is not None:
         error["fields"] = fields
@@ -18,7 +23,7 @@ def _error_response(*, code, message, status_code, fields=None):
 
 
 class BookingCreateAPIView(APIView):
-    """POST /api/v1/bookings/: validate input, delegate, serialize output."""
+    """POST /api/v1/bookings/: make the booking with idempotent retries."""
 
     def post(self, request):
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -44,8 +49,12 @@ class BookingCreateAPIView(APIView):
             )
 
         try:
-            # The service owns transaction.atomic and all booking business rules.
-            booking = create_booking(**request_serializer.validated_data)
+            result = create_idempotent_booking(
+                idempotency_key=idempotency_key,
+                booking_data=request_serializer.validated_data,
+                create_booking_fn=create_booking,
+                serialize_booking_fn=lambda booking: BookingResponseSerializer(booking).data,
+            )
         except InvalidBookingRequest as error:
             return _error_response(
                 code="validation_error",
@@ -58,8 +67,12 @@ class BookingCreateAPIView(APIView):
                 message=str(error),
                 status_code=status.HTTP_409_CONFLICT,
             )
+        except (IdempotencyKeyReused, IdempotencyRequestInProgress) as error:
+            return _error_response(
+                code=error.code,
+                message=str(error),
+                status_code=status.HTTP_409_CONFLICT,
+            )
 
-        return Response(
-            BookingResponseSerializer(booking).data,
-            status=status.HTTP_201_CREATED,
-        )
+        # Both first success and replay return the original status and body.
+        return Response(result.body, status=result.status_code)
