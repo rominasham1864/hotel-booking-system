@@ -12,6 +12,13 @@ if not SECRET_KEY:
     raise RuntimeError("DJANGO_SECRET_KEY is required. Copy .env.example to .env and set it.")
 
 DEBUG = os.getenv("DJANGO_DEBUG", "False").lower() in {"1", "true", "yes", "on"}
+SECURE_HTTPS = os.getenv("DJANGO_SECURE_HTTPS", "False").lower() in {
+    "1", "true", "yes", "on"
+}
+SECURE_SSL_REDIRECT = SECURE_HTTPS
+SESSION_COOKIE_SECURE = SECURE_HTTPS
+CSRF_COOKIE_SECURE = SECURE_HTTPS
+SECURE_HSTS_SECONDS = 3600 if SECURE_HTTPS else 0
 ALLOWED_HOSTS = [
     host.strip()
     for host in os.getenv("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
