@@ -1,5 +1,7 @@
+from unittest.mock import patch
+
 from django.db import IntegrityError, transaction
-from django.test import TransactionTestCase, skipUnlessDBFeature
+from django.test import TransactionTestCase, override_settings, skipUnlessDBFeature
 from django.utils import timezone
 from datetime import timedelta
 from urllib.parse import urlencode
@@ -56,6 +58,43 @@ class RoomAPITests(APITestCase):
 
     def create_room(self, label="101", beds=2, view=Room.View.SEA):
         return Room.objects.create(label=label, beds=beds, view=view)
+
+    def test_delete_with_invalid_room_id_returns_json_404(self):
+        room = self.create_room()
+
+        response = self.client.delete(
+            f"{self.list_url}invalid/", HTTP_ACCEPT="application/json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(response.json()["error"]["code"], "room_not_found")
+        self.assertTrue(Room.objects.filter(pk=room.pk).exists())
+
+    @override_settings(DEBUG=False)
+    def test_unknown_api_path_returns_json_404(self):
+        response = self.client.get("/api/v1/unknown/", HTTP_ACCEPT="application/json")
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(response.json()["error"]["code"], "not_found")
+
+    @override_settings(DEBUG=False)
+    def test_unexpected_api_error_returns_generic_json_500(self):
+        self.client.raise_request_exception = False
+        with patch(
+            "rooms.views.RoomViewSet.list", side_effect=RuntimeError("internal detail")
+        ):
+            response = self.client.get(self.list_url, HTTP_ACCEPT="application/json")
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertEqual(
+            response.json(),
+            {
+                "error": {
+                    "code": "internal_server_error",
+                    "message": "An internal server error occurred.",
+                }
+            },
+        )
 
     def test_create_room_trims_label_and_returns_created_room(self):
         response = self.client.post(
