@@ -548,12 +548,20 @@ class BookingIdempotencyAPITests(APITestCase):
         self.assertIsNotNone(record.request_id)
 
     def test_same_key_and_same_payload_replays_original_response(self):
-        first = self.post()
-        second = self.post()
+        with self.assertLogs("hotel.bookings", level="INFO") as logs:
+            first = self.post()
+            second = self.post()
         self.assertEqual((first.status_code, second.status_code), (201, 201))
         self.assertEqual(first.data, second.data)
         self.assertEqual(Booking.objects.count(), 1)
         self.assertEqual(IdempotencyRecord.objects.count(), 1)
+        created, replayed = logs.records
+        self.assertEqual(created.msg, "booking.created")
+        self.assertEqual(replayed.msg, "idempotency.replayed")
+        self.assertEqual(created.request_id, first["X-Request-ID"])
+        self.assertEqual(replayed.request_id, second["X-Request-ID"])
+        self.assertNotEqual(created.request_id, replayed.request_id)
+        self.assertEqual(created.idempotency_request_id, replayed.idempotency_request_id)
 
     def test_replay_retains_response_snapshot_after_room_changes(self):
         first = self.post()

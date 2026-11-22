@@ -1,5 +1,7 @@
 """Booking HTTP adapter for phases 6-8 (merged version)."""
 
+import logging
+
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -13,6 +15,7 @@ from bookings.exceptions import (
 from bookings.idempotency import create_idempotent_booking
 from bookings.serializers import BookingRequestSerializer, BookingResponseSerializer
 from bookings.services import create_booking
+logger = logging.getLogger("hotel.bookings")
 
 
 def _error_response(*, code, message, status_code, fields=None):
@@ -48,6 +51,7 @@ class BookingCreateAPIView(APIView):
                 fields=request_serializer.errors,
             )
 
+        request_fields = {"request_id": getattr(request, "request_id", None)}
         try:
             result = create_idempotent_booking(
                 idempotency_key=idempotency_key,
@@ -62,17 +66,30 @@ class BookingCreateAPIView(APIView):
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
         except NoAvailableRoom as error:
+            logger.info("booking.unavailable", extra=request_fields)
             return _error_response(
                 code="no_available_room",
                 message=str(error),
                 status_code=status.HTTP_409_CONFLICT,
             )
         except (IdempotencyKeyReused, IdempotencyRequestInProgress) as error:
+            logger.info(
+                "idempotency.rejected",
+                extra={**request_fields, "error_code": error.code},
+            )
             return _error_response(
                 code=error.code,
                 message=str(error),
                 status_code=status.HTTP_409_CONFLICT,
             )
 
-        # Both first success and replay return the original status and body.
+        logger.info(
+            "idempotency.replayed" if result.replayed else "booking.created",
+            extra={
+                **request_fields,
+                "booking_id": result.booking_id,
+                "idempotency_request_id": result.request_id,
+                "idempotency_outcome": "replayed" if result.replayed else "created",
+            },
+        )
         return Response(result.body, status=result.status_code)

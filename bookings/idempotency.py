@@ -28,6 +28,7 @@ from bookings.models import Booking, IdempotencyRecord
 class IdempotencyResult:
     status_code: int
     body: dict[str, Any]
+    booking_id: int
     request_id: str
     replayed: bool
 
@@ -131,6 +132,7 @@ def create_idempotent_booking(
             return IdempotencyResult(
                 status_code=record.response_status,
                 body=record.response_body,
+                booking_id=record.booking_id,
                 request_id=str(record.request_id),
                 replayed=True,
             )
@@ -162,6 +164,7 @@ def create_idempotent_booking(
         return IdempotencyResult(
             status_code=201,
             body=body,
+            booking_id=booking.pk,
             request_id=str(record.request_id),
             replayed=False,
         )
