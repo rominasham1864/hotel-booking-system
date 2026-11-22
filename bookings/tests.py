@@ -259,6 +259,27 @@ class BookingCreateAPITests(APITestCase):
         self.assertTrue(response.data["check_in"].endswith("Z"))
         self.assertTrue(response.data["check_out"].endswith("Z"))
 
+    def test_malformed_json_creates_neither_booking_nor_idempotency_record(self):
+        response = self.client.post(
+            BOOKINGS_URL, "{", content_type="application/json", HTTP_IDEMPOTENCY_KEY="key"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["error"]["code"], "validation_error")
+        self.assertFalse(Booking.objects.exists())
+        self.assertFalse(IdempotencyRecord.objects.exists())
+
+    def test_booking_preflight_does_not_grant_cross_origin_access(self):
+        response = self.client.options(
+            BOOKINGS_URL,
+            HTTP_ORIGIN="https://example.test",
+            HTTP_ACCESS_CONTROL_REQUEST_METHOD="POST",
+            HTTP_ACCESS_CONTROL_REQUEST_HEADERS="content-type,idempotency-key",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.has_header("Access-Control-Allow-Origin"))
+
     def test_selects_next_free_room(self):
         Booking.objects.create(
             room=self.first_room,
@@ -541,6 +562,20 @@ class BookingIdempotencyAPITests(APITestCase):
         self.assertEqual(replay.data, first.data)
         self.assertEqual(replay.data["room"]["label"], "101")
 
+    def test_replay_preserves_response_after_confirmed_room_deletion(self):
+        first = self.post()
+        self.assertEqual(first.status_code, status.HTTP_201_CREATED)
+        room_id = first.data["room"]["id"]
+        deletion = self.client.delete(f"/api/v1/rooms/{room_id}/?confirm=true")
+        self.assertEqual(deletion.status_code, status.HTTP_204_NO_CONTENT)
+
+        replay = self.post()
+
+        self.assertEqual(replay.status_code, first.status_code)
+        self.assertEqual(replay.data, first.data)
+        self.assertFalse(Booking.objects.exists())
+        self.assertEqual(IdempotencyRecord.objects.count(), 1)
+
     def test_identical_instant_with_different_utc_offset_is_same_payload(self):
         first = self.post()
         offset = datetime_timezone(timedelta(hours=3, minutes=30))
@@ -615,6 +650,18 @@ class BookingIdempotencyAPITests(APITestCase):
                     request_hash="0" * 64,
                 )
         self.assertEqual(IdempotencyRecord.objects.count(), 1)
+
+    def test_database_rejects_completed_record_without_response_status(self):
+        response = self.post()
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        with self.assertRaises(IntegrityError) as error, transaction.atomic():
+            IdempotencyRecord.objects.update(response_status=None)
+
+        self.assertEqual(
+            error.exception.__cause__.diag.constraint_name,
+            "bookings_idempotency_valid_state",
+        )
 
     def test_existing_processing_record_returns_in_progress(self):
         semantic_data = {

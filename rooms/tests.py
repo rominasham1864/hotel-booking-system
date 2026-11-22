@@ -1,12 +1,13 @@
 from unittest.mock import patch
 
+from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
 from django.test import TransactionTestCase, override_settings, skipUnlessDBFeature
 from django.utils import timezone
 from datetime import timedelta
 from urllib.parse import urlencode
 from rest_framework import status
-from rest_framework.test import APITestCase
+from rest_framework.test import APIClient, APITestCase
 
 from bookings.models import Booking
 from rooms.models import Room
@@ -106,6 +107,30 @@ class RoomAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data["label"], "101")
         self.assertEqual(Room.objects.count(), 1)
+
+    def test_room_label_with_apostrophe_and_wildcards_is_literal(self):
+        self.create_room(label="O'BrienAB")
+        label = "O'Brien%_"
+
+        response = self.client.post(
+            self.list_url, {"label": label, "beds": 2, "view": "sea"}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(Room.objects.get(label__iexact=label).pk, response.data["id"])
+        self.assertEqual(Room.objects.count(), 2)
+
+    def test_session_authenticated_room_write_requires_csrf_token(self):
+        client = APIClient(enforce_csrf_checks=True)
+        client.force_login(get_user_model().objects.create_user(username="room-user"))
+
+        response = client.post(
+            self.list_url, {"label": "101", "beds": 2, "view": "sea"}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(response.data["error"]["code"], "permission_denied")
+        self.assertFalse(Room.objects.exists())
 
     def test_create_room_from_html_form_with_csrf_token(self):
         form = self.client.get(self.list_url, HTTP_ACCEPT="text/html")
