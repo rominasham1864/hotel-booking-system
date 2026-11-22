@@ -105,6 +105,7 @@ class IdempotencyRecord(models.Model):
                     | models.Q(
                         status="completed",
                         booking_id__isnull=False,
+                        response_status__isnull=False,
                         response_status=201,
                         response_body__isnull=False,
                     )
