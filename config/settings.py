@@ -38,6 +38,7 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    "config.middleware.RequestLoggingMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -101,14 +102,17 @@ LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
     "formatters": {
-        "simple": {"format": "{asctime} {levelname} {name}: {message}", "style": "{"},
+        "json": {"()": "config.logging.JsonLogFormatter"},
     },
     "handlers": {
-        "console": {"class": "logging.StreamHandler", "formatter": "simple"},
+        "console": {"class": "logging.StreamHandler", "formatter": "json", "level": LOG_LEVEL},
     },
     "root": {"handlers": ["console"], "level": LOG_LEVEL},
     "loggers": {
         "django": {"handlers": ["console"], "level": LOG_LEVEL, "propagate": False},
+        "django.request": {"level": "ERROR"},
+        "django.server": {"handlers": [], "propagate": False},
+        "django.db.backends": {"handlers": [], "propagate": False},
     },
 }
 
