@@ -1,4 +1,4 @@
-"""Booking HTTP adapter for phases 6-8 (merged version)."""
+"""Booking HTTP adapter."""
 
 import logging
 

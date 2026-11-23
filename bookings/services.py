@@ -1,6 +1,5 @@
 """Hotel booking business rules.
 
-IMPORTANT: Merge into your existing service after checking your local models.
 The read-only find_available_room() is a snapshot, not a concurrency guarantee.
 Only create_booking() performs a transaction, row locks, and a post-lock check.
 PostgreSQL's exclusion constraint is the final invariant against overlaps.
