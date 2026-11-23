@@ -1,0 +1,51 @@
+name: CI
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  django:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DJANGO_SECRET_KEY: ci-only-placeholder
+      DJANGO_DEBUG: "False"
+      DJANGO_SECURE_HTTPS: "False"
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: hotel_booking
+      POSTGRES_USER: hotel_booking
+      POSTGRES_PASSWORD: ci-only-password
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: hotel_booking
+          POSTGRES_USER: hotel_booking
+          POSTGRES_PASSWORD: ci-only-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hotel_booking -d hotel_booking"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Check Django and migrations
+        run: |
+          python manage.py check
+          python manage.py makemigrations --check --dry-run
+      - name: Run tests on PostgreSQL
+        run: python manage.py test --noinput --verbosity 2
+      - name: Validate OpenAPI
+        run: python manage.py spectacular --file /tmp/schema.yaml --validate --fail-on-warn

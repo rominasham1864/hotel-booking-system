@@ -122,15 +122,29 @@ A successful request returns `201 Created` with the booking and room details. In
 
 ## Running Tests
 
-Run the full suite against PostgreSQL, either locally or inside the web container:
+Run the suite against PostgreSQL 16. Django creates a separate test database and applies migrations automatically. The test role needs permission to create the database and install `btree_gist`.
+
+With Docker Compose:
 
 ```powershell
-.\.venv\Scripts\python.exe manage.py test
-# Or, with the Compose services running:
-docker compose exec web python manage.py test
+docker compose up -d --build --wait
+docker compose exec -T web python manage.py test --noinput
 ```
 
-Django creates a separate test database, applies migrations, and removes it after the run. The suite covers API behavior, database constraints, transaction rollback, concurrent bookings, Idempotency, and log redaction. PostgreSQL is required to exercise row locking, advisory locks, and the exclusion constraint.
+For local execution, use the PostgreSQL connection settings from [Installation](#installation):
+
+```powershell
+.\.venv\Scripts\python.exe manage.py test --noinput
+```
+
+The [CI workflow](.github/workflows/ci.yml) runs the PostgreSQL suite, checks for missing migrations, and validates the OpenAPI schema.
+
+## Release Checklist
+
+- [ ] Keep secrets, database exports, and sensitive logs out of Git.
+- [ ] Configure production HTTPS and allowed hosts, disable debug mode, and run `python manage.py check --deploy`.
+- [ ] Review database privileges and access to API write operations, Swagger, and OpenAPI.
+- [ ] Confirm CI passes and verify `/health/` and `/api/v1/schema/` after deployment.
 
 ## Project Structure
 
