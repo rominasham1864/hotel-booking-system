@@ -10,6 +10,7 @@ from django.utils.dateparse import parse_datetime
 from rest_framework import serializers
 
 from bookings.models import Booking
+from rooms.models import Room
 from rooms.serializers import RoomSerializer
 
 
@@ -51,7 +52,7 @@ class BookingRequestSerializer(serializers.Serializer):
 
     user_id = serializers.CharField(max_length=128, trim_whitespace=True)
     beds = serializers.IntegerField(min_value=1, max_value=5)
-    view = serializers.ChoiceField(choices=("sea", "mountain", "yard"))
+    view = serializers.ChoiceField(choices=Room.View.choices)
     check_in = OffsetAwareDateTimeField()
     check_out = OffsetAwareDateTimeField()
 

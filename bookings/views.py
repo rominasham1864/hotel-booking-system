@@ -2,6 +2,7 @@
 
 import logging
 
+from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -15,6 +16,9 @@ from bookings.exceptions import (
 from bookings.idempotency import create_idempotent_booking
 from bookings.serializers import BookingRequestSerializer, BookingResponseSerializer
 from bookings.services import create_booking
+from config.api_schema import error_response
+
+
 logger = logging.getLogger("hotel.bookings")
 
 
@@ -28,6 +32,38 @@ def _error_response(*, code, message, status_code, fields=None):
 class BookingCreateAPIView(APIView):
     """POST /api/v1/bookings/: make the booking with idempotent retries."""
 
+    @extend_schema(
+        description=(
+            "All request fields are required. Unknown fields are rejected. "
+            "Both timestamps must include a UTC offset or Z, and check_out "
+            "must be later than check_in. Response timestamps are in UTC."
+        ),
+        parameters=[
+            OpenApiParameter(
+                name="Idempotency-Key",
+                type={"type": "string", "minLength": 1, "maxLength": 255, "pattern": r"\S"},
+                location=OpenApiParameter.HEADER,
+                required=True,
+                description=(
+                    "Key scoped to the user_id. Reuse it with the same booking "
+                    "data to replay a successful response."
+                ),
+            ),
+        ],
+        request=BookingRequestSerializer,
+        responses={
+            201: OpenApiResponse(
+                BookingResponseSerializer,
+                description="Booking created or original successful response replayed.",
+            ),
+            400: error_response(
+                "validation_error: invalid Idempotency-Key, malformed body, or invalid booking data."
+            ),
+            409: error_response(
+                "no_available_room, idempotency_key_reused, or idempotency_request_in_progress."
+            ),
+        },
+    )
     def post(self, request):
         idempotency_key = request.headers.get("Idempotency-Key")
         if (

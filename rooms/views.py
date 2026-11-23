@@ -1,4 +1,5 @@
 from django.db import IntegrityError, transaction
+from drf_spectacular.utils import OpenApiParameter, extend_schema, extend_schema_view
 from rest_framework import status, viewsets
 from rest_framework.exceptions import ValidationError
 from rest_framework.generics import get_object_or_404
@@ -6,11 +7,57 @@ from rest_framework.response import Response
 
 from bookings.models import Booking
 from config.api_exceptions import APIConflict
+from config.api_schema import error_response
 from rooms.models import Room
 from rooms.pagination import RoomPagination
 from rooms.serializers import RoomFilterSerializer, RoomSerializer
 
 
+ROOM_NOT_FOUND = error_response("room_not_found. The room ID is invalid or does not exist.")
+INVALID_ROOM = error_response("validation_error. The request body is malformed or invalid.")
+DUPLICATE_LABEL = error_response("duplicate_room_label. A room with this label already exists.")
+ROOM_WRITE_DESCRIPTION = (
+    "Unknown and read-only fields are rejected. Labels are trimmed and compared "
+    "case-insensitively for uniqueness. Views are normalized to lowercase."
+)
+
+
+@extend_schema_view(
+    list=extend_schema(
+        parameters=[
+            RoomFilterSerializer,
+            OpenApiParameter(
+                "page", {"type": "integer", "minimum": 1}, default=1
+            ),
+            OpenApiParameter(
+                "page_size", {"type": "integer", "minimum": 1, "maximum": 100},
+                default=20,
+            ),
+        ],
+        responses={
+            200: RoomSerializer(many=True),
+            400: error_response("validation_error. Invalid filters or pagination parameters."),
+            404: error_response("page_not_found. The requested page does not exist."),
+        },
+    ),
+    create=extend_schema(
+        description=ROOM_WRITE_DESCRIPTION,
+        responses={201: RoomSerializer, 400: INVALID_ROOM, 409: DUPLICATE_LABEL},
+    ),
+    retrieve=extend_schema(responses={200: RoomSerializer, 404: ROOM_NOT_FOUND}),
+    update=extend_schema(
+        description=ROOM_WRITE_DESCRIPTION,
+        responses={
+            200: RoomSerializer, 400: INVALID_ROOM, 404: ROOM_NOT_FOUND, 409: DUPLICATE_LABEL
+        },
+    ),
+    partial_update=extend_schema(
+        description=ROOM_WRITE_DESCRIPTION,
+        responses={
+            200: RoomSerializer, 400: INVALID_ROOM, 404: ROOM_NOT_FOUND, 409: DUPLICATE_LABEL
+        },
+    ),
+)
 class RoomViewSet(viewsets.ModelViewSet):
     serializer_class = RoomSerializer
     pagination_class = RoomPagination
@@ -52,6 +99,20 @@ class RoomViewSet(viewsets.ModelViewSet):
     def perform_update(self, serializer):
         self._save_serializer(serializer)
 
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                "confirm", str, enum=["true", "false"],
+                description="Use true to delete the room and all associated bookings.",
+            ),
+        ],
+        responses={
+            204: None,
+            400: error_response("validation_error. Invalid confirm value."),
+            404: ROOM_NOT_FOUND,
+            409: error_response("confirmation_required. The room has associated bookings."),
+        },
+    )
     def destroy(self, request, *args, **kwargs):
         confirmation = request.query_params.get("confirm")
         if confirmation not in (None, "true", "false"):

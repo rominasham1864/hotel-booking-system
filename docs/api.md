@@ -1,5 +1,13 @@
 # Hotel Booking API Reference
 
+Download the OpenAPI schema from `GET /api/v1/schema/`. Use
+`/api/v1/schema/?format=json` for JSON. To generate and validate the YAML schema
+locally with the project environment configured, run:
+
+```shell
+python manage.py spectacular --file schema.yaml --validate --fail-on-warn
+```
+
 The development server defaults to `http://localhost:8000`. Use `Accept: application/json` for JSON responses and `Content-Type: application/json` when sending a JSON body. Only booking creation requires `Idempotency-Key`. Responses include `X-Request-ID` for log correlation. The product API accepts anonymous requests, and session-authenticated write requests are subject to CSRF validation.
 
 ## Room endpoints
